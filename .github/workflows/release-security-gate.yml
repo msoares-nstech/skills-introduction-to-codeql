@@ -1,0 +1,206 @@
+name: "Release Security Gate"
+
+# Gate PRÉ-TAG da virada de sprint. Rodado manualmente pelo release manager no momento de
+# cortar a tag. Objetivo: SÓ liberar a release se a branch de referência não tiver alerta
+# CodeQL aberto de severidade high/critical.
+#
+# Princípio: este workflow NÃO re-escaneia. O CodeQL (codeql.yml) já roda continuamente e
+# mantém os alertas de Code Scanning atualizados; aqui apenas LEMOS esses resultados via API
+# (job security-gate, ~segundos, ubuntu-latest). Se o gate passar, o job release-actions faz
+# a virada: cria a tag, cria/renomeia a branch da próxima sprint e religa a base dos PRs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch de referência, base para a TAG (ex.: main, release/9.1/9.1.3.0)"
+        required: true
+        default: "main"
+      tag:
+        description: "Tag/release a ser criada (ex.: 9.1.3.0)"
+        required: true
+      branch:
+        description: "Nome da nova branch da próxima sprint (obrigatório para new/rename)"
+        required: false
+        default: ""
+      branch_action:
+        description: "new = cria nova branch a partir da ref | rename = renomeia a ref"
+        type: choice
+        required: true
+        default: "new"
+        options:
+          - new
+          - rename
+      adjust_pr_base:
+        description: "Religar a base dos PRs abertos (base=ref) para a nova branch"
+        type: boolean
+        required: false
+        default: false
+
+# security-events:read -> ler alertas de Code Scanning | contents:write -> criar tag e branch
+# pull-requests:write -> retargetar a base dos PRs abertos
+permissions:
+  security-events: read
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-gate-${{ github.event.inputs.ref }}
+  cancel-in-progress: false
+
+jobs:
+  security-gate:
+    name: "Security Gate (high/critical)"
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      REF_INPUT: ${{ github.event.inputs.ref }}
+    outputs:
+      # SHA exato do tip validado pelo gate. release-actions tagueia ESSE commit, não um novo
+      # tip que possa ter surgido enquanto o gate rodava (fecha TOCTOU entre avaliar e tagar).
+      tip_sha: ${{ steps.gate.outputs.tip_sha }}
+    steps:
+      - name: Avaliar alertas CodeQL (freshness guard + política high/critical)
+        id: gate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Aceita "main" ou "refs/heads/main"
+          REF_SHORT="${REF_INPUT#refs/heads/}"
+          FULL_REF="refs/heads/${REF_SHORT}"
+          echo "Ref avaliada: $FULL_REF"
+
+          # Tip atual da branch de referência
+          TIP_SHA=$(gh api "/repos/$REPO/commits/$REF_SHORT" --jq '.sha')
+          echo "Tip SHA: $TIP_SHA"
+          echo "tip_sha=$TIP_SHA" >> "$GITHUB_OUTPUT"
+
+          # --- FRESHNESS GUARD ---
+          # A última análise CodeQL da ref precisa ser exatamente o tip. Se o commit do tip ainda
+          # não foi analisado (scan em andamento ou cancelado por concurrency no codeql.yml), um
+          # "zero alertas" seria um FALSO-VERDE. Nesse caso, PARA e pede o scan.
+          ANALYZED_SHA=$(gh api "/repos/$REPO/code-scanning/analyses?ref=$FULL_REF&tool_name=CodeQL&per_page=1" \
+            --jq '.[0].commit_sha // ""' || echo "")
+          if [ -z "$ANALYZED_SHA" ]; then
+            echo "::error::Nenhuma análise CodeQL para $FULL_REF. Rode/aguarde o scan antes de liberar."
+            {
+              echo "## ❌ Release Security Gate — SEM ANÁLISE"
+              echo "Não há análise CodeQL registrada para \`$FULL_REF\`."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          if [ "$ANALYZED_SHA" != "$TIP_SHA" ]; then
+            echo "::error::Análise desatualizada: analisado=$ANALYZED_SHA, tip=$TIP_SHA."
+            {
+              echo "## ❌ Release Security Gate — ANÁLISE DESATUALIZADA"
+              echo "- Tip da ref: \`$TIP_SHA\`"
+              echo "- Último commit analisado: \`$ANALYZED_SHA\`"
+              echo ""
+              echo "Aguarde o CodeQL do último push terminar e rode de novo."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          # --- COLETA + POLÍTICA ---
+          # Alertas OPEN do CodeQL nessa ref, agrupados por security_severity_level.
+          ALERTS=$(gh api --paginate \
+            "/repos/$REPO/code-scanning/alerts?state=open&ref=$FULL_REF&tool_name=CodeQL&per_page=100" \
+            --jq '[.[] | {sev: (.rule.security_severity_level // "none"), name: .rule.id, url: .html_url}]' \
+            | jq -s 'add // []')
+
+          CRIT=$(echo "$ALERTS" | jq '[.[] | select(.sev=="critical")] | length')
+          HIGH=$(echo "$ALERTS" | jq '[.[] | select(.sev=="high")]     | length')
+          MED=$(echo "$ALERTS"  | jq '[.[] | select(.sev=="medium")]   | length')
+          LOW=$(echo "$ALERTS"  | jq '[.[] | select(.sev=="low")]      | length')
+          echo "Critical=$CRIT High=$HIGH Medium=$MED Low=$LOW"
+
+          {
+            echo "## Release Security Gate — \`$FULL_REF\` @ \`${TIP_SHA:0:8}\`"
+            echo ""
+            echo "| Severidade | Qtd | Bloqueia |"
+            echo "|---|---|---|"
+            echo "| Critical | $CRIT | ✅ |"
+            echo "| High     | $HIGH | ✅ |"
+            echo "| Medium   | $MED | — |"
+            echo "| Low      | $LOW | — |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          BLOCKING=$((CRIT + HIGH))
+          if [ "$BLOCKING" -gt 0 ]; then
+            {
+              echo ""
+              echo "### ❌ Bloqueado: $BLOCKING alerta(s) high/critical aberto(s)"
+              echo "$ALERTS" | jq -r '.[] | select(.sev=="critical" or .sev=="high") | "- **\(.sev)** \(.name) — \(.url)"'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::Gate bloqueado: $CRIT critical + $HIGH high abertos em $FULL_REF."
+            exit 1
+          fi
+
+          echo "### ✅ Aprovado: nenhum alerta high/critical aberto" >> "$GITHUB_STEP_SUMMARY"
+
+  release-actions:
+    name: "Release actions (tag + branch + PRs)"
+    runs-on: ubuntu-latest
+    needs: security-gate
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      REF_INPUT: ${{ github.event.inputs.ref }}
+      TAG: ${{ github.event.inputs.tag }}
+      NEW_BRANCH: ${{ github.event.inputs.branch }}
+      BRANCH_ACTION: ${{ github.event.inputs.branch_action }}
+      TIP_SHA: ${{ needs.security-gate.outputs.tip_sha }}
+    steps:
+      - name: Criar tag anotada
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Tag anotada (fiel à convenção MultiCTe) apontando pro tip já validado pelo gate.
+          TAG_OBJ=$(gh api --method POST "/repos/$REPO/git/tags" \
+            -f tag="$TAG" -f message="release da $TAG" -f object="$TIP_SHA" -f type="commit" \
+            --jq '.sha')
+          gh api --method POST "/repos/$REPO/git/refs" -f ref="refs/tags/$TAG" -f sha="$TAG_OBJ"
+          echo "## 🏷️ Tag \`$TAG\` criada em \`${TIP_SHA:0:8}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Branch da próxima sprint
+        shell: bash
+        run: |
+          set -euo pipefail
+          REF_SHORT="${REF_INPUT#refs/heads/}"
+          if [ -z "$NEW_BRANCH" ]; then
+            echo "::error::branch_action=$BRANCH_ACTION exige o input 'branch' (nome da nova branch)."
+            exit 1
+          fi
+
+          if [ "$BRANCH_ACTION" = "new" ]; then
+            gh api --method POST "/repos/$REPO/git/refs" \
+              -f ref="refs/heads/$NEW_BRANCH" -f sha="$TIP_SHA"
+            echo "## 🌿 Branch \`$NEW_BRANCH\` criada a partir de \`$REF_SHORT\`" >> "$GITHUB_STEP_SUMMARY"
+          else
+            # rename: a API de rename do GitHub renomeia a branch E retargeta automaticamente os
+            # PRs abertos + branch protections. Por isso o retarget manual abaixo só roda no 'new'.
+            gh api --method POST "/repos/$REPO/branches/$REF_SHORT/rename" -f new_name="$NEW_BRANCH"
+            echo "## 🌿 Branch \`$REF_SHORT\` → \`$NEW_BRANCH\` (rename; PRs retargetados pelo GitHub)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Religar base dos PRs (somente branch_action=new)
+        # No rename o GitHub já move a base dos PRs. Aqui tratamos o 'new', em que a base antiga
+        # continua existindo e os PRs precisam ser movidos manualmente para a nova branch.
+        if: ${{ github.event.inputs.adjust_pr_base == 'true' && github.event.inputs.branch_action == 'new' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          REF_SHORT="${REF_INPUT#refs/heads/}"
+          mapfile -t NUMS < <(gh api --paginate \
+            "/repos/$REPO/pulls?state=open&base=$REF_SHORT&per_page=100" --jq '.[].number')
+          if [ "${#NUMS[@]}" -eq 0 ]; then
+            echo "Nenhum PR aberto com base=$REF_SHORT." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo "### 🔀 PRs retargetados ($REF_SHORT → $NEW_BRANCH)" >> "$GITHUB_STEP_SUMMARY"
+          for n in "${NUMS[@]}"; do
+            gh api --method PATCH "/repos/$REPO/pulls/$n" -f base="$NEW_BRANCH" >/dev/null
+            echo "- PR #$n" >> "$GITHUB_STEP_SUMMARY"
+          done
