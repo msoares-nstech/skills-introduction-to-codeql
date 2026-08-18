@@ -1,0 +1,189 @@
+name: "Release Branches Security Alert"
+
+# Monitoramento contínuo (fora do momento de virada de sprint): varre TODAS as branches
+# `release/**` em busca de alertas CodeQL abertos com severidade high/critical e, se
+# encontrar algum, dispara um alerta no canal do Microsoft Teams configurado.
+#
+# Diferença para o release-security-gate.yml: aquele é um gate manual, rodado sob demanda
+# para UMA branch de referência no momento de cortar a tag. Este aqui roda sozinho, em todas
+# as branches release/**, e serve para dar visibilidade antecipada de findings — antes de
+# alguém tentar liberar a release e ser barrado pelo gate.
+#
+# Não re-escaneia: o CodeQL (codeql.yml) já mantém os alertas de Code Scanning atualizados;
+# aqui apenas LEMOS esses resultados via API (rápido, ubuntu-latest, sem checkout).
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # 3x ao dia (horário UTC): 06:00, 14:00 e 22:00.
+    - cron: '0 6,14,22 * * *'
+
+permissions:
+  security-events: read
+  contents: read
+
+concurrency:
+  group: release-branches-security-alert
+  cancel-in-progress: true
+
+jobs:
+  scan-release-branches:
+    name: "Buscar findings high/critical em release/**"
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      # Webhook do canal do Teams que deve receber o alerta (Teams -> Workflows / Power
+      # Automate "quando uma requisição HTTP do Teams for recebida"). Guardado como secret
+      # do repositório; pode apontar para um canal diferente do usado pelo release-security-gate.
+      TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_SECURITY_ALERTS_WEBHOOK_URL }}
+    steps:
+      - name: Coletar branches release/** com alertas high/critical
+        id: scan
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # --- 1) Lista todas as branches que casam com release/** ---
+          BRANCHES=$(gh api --paginate "/repos/$REPO/branches?per_page=100" --jq '.[].name' \
+            | grep -E '^release/' || true)
+
+          if [ -z "$BRANCHES" ]; then
+            echo "## Release Branches Security Alert" >> "$GITHUB_STEP_SUMMARY"
+            echo "Nenhuma branch \`release/**\` encontrada." >> "$GITHUB_STEP_SUMMARY"
+            echo "has_findings=false" >> "$GITHUB_OUTPUT"
+            echo "findings_json=[]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # --- 2) Para cada branch, coleta alertas OPEN do CodeQL com severidade high/critical ---
+          ALL_FINDINGS="[]"
+          SUMMARY_ROWS=""
+          while IFS= read -r branch; do
+            [ -z "$branch" ] && continue
+            FULL_REF="refs/heads/$branch"
+
+            BRANCH_ALERTS=$(gh api --paginate \
+              "/repos/$REPO/code-scanning/alerts?state=open&ref=$FULL_REF&tool_name=CodeQL&per_page=100" \
+              2>/dev/null | jq --arg branch "$branch" '
+                [ .[]
+                  | select(.rule.security_severity_level=="high" or .rule.security_severity_level=="critical")
+                  | { branch: $branch, sev: .rule.security_severity_level, name: .rule.id, url: .html_url }
+                ]' || echo "[]")
+
+            COUNT=$(echo "$BRANCH_ALERTS" | jq 'length')
+            if [ "$COUNT" -gt 0 ]; then
+              CRIT=$(echo "$BRANCH_ALERTS" | jq '[.[] | select(.sev=="critical")] | length')
+              HIGH=$(echo "$BRANCH_ALERTS" | jq '[.[] | select(.sev=="high")] | length')
+              SUMMARY_ROWS="${SUMMARY_ROWS}| \`${branch}\` | ${CRIT} | ${HIGH} |\n"
+            fi
+
+            ALL_FINDINGS=$(echo "$ALL_FINDINGS" | jq --argjson new "$BRANCH_ALERTS" '. + $new')
+          done <<< "$BRANCHES"
+
+          TOTAL=$(echo "$ALL_FINDINGS" | jq 'length')
+
+          {
+            echo "## Release Branches Security Alert"
+            echo ""
+            echo "Branches verificadas:"
+            echo '```'
+            echo "$BRANCHES"
+            echo '```'
+            echo ""
+            if [ "$TOTAL" -gt 0 ]; then
+              echo "### ❌ $TOTAL alerta(s) high/critical aberto(s)"
+              echo ""
+              echo "| Branch | Critical | High |"
+              echo "|---|---|---|"
+              printf "%b" "$SUMMARY_ROWS"
+              echo ""
+              echo "$ALL_FINDINGS" | jq -r '.[] | "- **\(.branch)** [\(.sev)] \(.name) — \(.url)"'
+            else
+              echo "### ✅ Nenhum alerta high/critical aberto em nenhuma branch \`release/**\`"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$TOTAL" -gt 0 ]; then
+            echo "has_findings=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_findings=false" >> "$GITHUB_OUTPUT"
+          fi
+          # Achata para uma linha só (jq -c) pra passar com segurança via GITHUB_OUTPUT.
+          echo "findings_json=$(echo "$ALL_FINDINGS" | jq -c '.')" >> "$GITHUB_OUTPUT"
+
+      - name: Alertar Teams
+        if: steps.scan.outputs.has_findings == 'true'
+        shell: bash
+        env:
+          FINDINGS_JSON: ${{ steps.scan.outputs.findings_json }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${TEAMS_WEBHOOK_URL:-}" ]; then
+            echo "::warning::TEAMS_SECURITY_ALERTS_WEBHOOK_URL não configurado — pulando notificação."
+            exit 0
+          fi
+
+          TOTAL=$(echo "$FINDINGS_JSON" | jq 'length')
+          CRIT=$(echo "$FINDINGS_JSON" | jq '[.[] | select(.sev=="critical")] | length')
+          HIGH=$(echo "$FINDINGS_JSON" | jq '[.[] | select(.sev=="high")] | length')
+          BRANCH_COUNT=$(echo "$FINDINGS_JSON" | jq '[.[].branch] | unique | length')
+
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+          # Lista os achados agrupados por branch, no formato "branch: N critical, M high".
+          BRANCH_FACTS=$(echo "$FINDINGS_JSON" | jq -c '
+            group_by(.branch)
+            | map({
+                title: .[0].branch,
+                value: (
+                  ( [.[] | select(.sev=="critical")] | length | tostring ) + " critical, " +
+                  ( [.[] | select(.sev=="high")]     | length | tostring ) + " high"
+                )
+              })')
+
+          # Até 10 itens individuais (link direto pro alerta) pra não estourar o tamanho do card.
+          ALERT_ITEMS=$(echo "$FINDINGS_JSON" | jq -c '
+            [ .[:10][] | {
+                type: "TextBlock", wrap: true, spacing: "Small",
+                text: ("**[\(.sev)]** \(.branch) — \(.name)")
+              }
+            ]')
+
+          PAYLOAD=$(jq -n \
+            --arg total "$TOTAL" --arg crit "$CRIT" --arg high "$HIGH" --arg branches "$BRANCH_COUNT" \
+            --arg repo "$GITHUB_REPOSITORY" --arg url "$RUN_URL" \
+            --argjson branchFacts "$BRANCH_FACTS" --argjson items "$ALERT_ITEMS" '
+            {
+              type: "message",
+              attachments: [{
+                contentType: "application/vnd.microsoft.card.adaptive",
+                content: {
+                  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                  type: "AdaptiveCard",
+                  version: "1.4",
+                  body: ([
+                    { type: "TextBlock", size: "Large", weight: "Bolder", text: "🚨 Alertas de segurança em branches release" },
+                    { type: "TextBlock", weight: "Bolder", color: "Attention", wrap: true,
+                      text: ($total + " alerta(s) high/critical aberto(s) em " + $branches + " branch(es) `release/**`") },
+                    { type: "FactSet", facts: [
+                      { title: "Repositório", value: $repo },
+                      { title: "Critical",    value: $crit },
+                      { title: "High",        value: $high }
+                    ]},
+                    { type: "TextBlock", weight: "Bolder", text: "Por branch:" },
+                    { type: "FactSet", facts: $branchFacts }
+                  ] + (if ($items | length) > 0 then
+                        [{ type: "TextBlock", weight: "Bolder", text: "Exemplos:" }] + $items
+                      else [] end)),
+                  actions: [
+                    { type: "Action.OpenUrl", title: "Ver execução", url: $url }
+                  ]
+                }
+              }]
+            }')
+
+          curl -sS --fail -X POST -H "Content-Type: application/json" \
+            -d "$PAYLOAD" "$TEAMS_WEBHOOK_URL"
+          echo "Alerta enviado ao Teams."
