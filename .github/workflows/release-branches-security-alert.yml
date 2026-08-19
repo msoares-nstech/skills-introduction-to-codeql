@@ -14,9 +14,6 @@ name: "Release Branches Security Alert"
 
 on:
   workflow_dispatch: {}
-  schedule:
-    # 3x ao dia (horário UTC): 06:00, 14:00 e 22:00.
-    - cron: '0 6,14,22 * * *'
 
 permissions:
   security-events: read
